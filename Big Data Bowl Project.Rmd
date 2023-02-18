@@ -1,0 +1,246 @@
+---
+title: "Big Data Bowl Project"
+author: "Jacob Kauffman"
+date: "10/24/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+options("scipen"=999)
+library(rlang)
+library(foreign)
+library(aod)
+library(sandwich)
+library(lmtest)
+library(car)
+library(stargazer)
+library(tidyverse)
+library(plm)
+library(rvest)
+library(tidymodels)
+library(ggridges)
+library(randomForest)
+library(datasets)
+library(caret)
+```
+
+```{r}
+##1
+nfl_bowl_data <- read.csv("train.csv", stringsAsFactors = F)
+nfl_bowl_data_test <- read.csv("test.csv", stringsAsFactors = F)
+```
+
+```{r}
+ggplot (nfl_bowl_data[1:22,],aes(x=X,y=Y,color=Team))+
+  geom_point(size=3) +
+  ylim(0,53)+
+  theme_bw()
+table (nfl_bowl_data$PlayDirection)
+# adjust player tracking coordinates
+ nfl_bowl  <- nfl_bowl_data %>% mutate(NflRusherYes = ifelse (NflId==NflIdRusher,1,0), # identify rushers
+                                       YardFromHome = ifelse (PossessionTeam==FieldPosition,YardLine,50+(50-YardLine)), # Yards from own goal if PossessionTeam==FieldPosition
+                                       TeamOffense = ifelse(PossessionTeam == HomeTeamAbbr, 'home', 'away'), # home or away team on offense if PossessionTeam == HomeTeamAbbr
+                                       Offense = ifelse(Team == TeamOffense,1,0), # offensive team or defensive team if team == TeamOffense
+                                       X_new = ifelse(PlayDirection=='left', 120-X, X) - 10, # flip X if plays moving from right to left
+                                       Y_new = ifelse(PlayDirection=='left', 160/3-Y, Y),# flip Y if [plays moving from right to left
+                                       YardToGo = 100-YardFromHome, # calculate yards to go
+                                       Dir_new = ifelse(PlayDirection=='left', Dir-180, Dir), # flip player directions if plays moving from right to left
+                                       Dir_new = ifelse(Dir_new<0, Dir_new+360, Dir_new)) # flip player directions if plays moving from right to left
+
+
+ggplot (nfl_bowl[1:22,],aes(x=X_new,y=Y_new,color=Team))+
+  geom_point(size=3) + 
+  ylim(0,53)+
+  geom_vline(aes(xintercept=YardFromHome), linetype="dashed")+
+  theme_bw()
+
+# create lines pointing player motion directions
+nfl_bowl2 <- nfl_bowl %>% mutate (X_end = 2*sin(Dir_new*pi/180) + X_new,
+                                  Y_end = 2*cos(Dir_new*pi/180) + Y_new)
+
+
+# visualize player motion directions in rushing plays
+ggplot (nfl_bowl2[1:22,],aes(x=X_new,y=Y_new,color=Team))+
+  geom_point(size=3) + 
+  geom_segment(aes(x = X_new, y = Y_new, xend = X_end,
+                   yend = Y_end), arrow = arrow(length = unit(.2,"cm")))+
+  geom_vline(aes(xintercept=YardFromHome), linetype="dashed")+
+  theme_bw()
+
+# build a function to calculate average x, y and distance
+feature_engineering= function(x,y,z,k) {
+  index_carrier = which(y==1) # index of the ball carrier
+  index_offense = which(x==1 & y==0) # index of offensive players
+  
+  x_offense_mean <- mean(z[index_offense]) # mean of x for offensive players
+  y_offense_mean <- mean(k[index_offense]) # mean of y for offensive players
+  x_offense_sd <- sd(z[index_offense]) # sd of x for offensive players
+  y_offense_sd <- sd(k[index_offense]) # sd of y for offensive players
+  
+  # get offensive players' x and y
+  data_offense_dis <- data.frame(xs=z[index_offense],ys=k[index_offense])
+  
+  # calculate each offensive player's distance to the ball carrier
+  dis_offense <- apply(data_offense_dis,1,function(x){
+    dist(rbind(c(as.numeric(x['xs']),z[index_carrier]),c(as.numeric(x['ys']),k[index_carrier])))
+    })
+  
+  # mean distance
+  dis_offense_mean <- mean(dis_offense)
+  # sd distance
+  dis_offense_sd <- sd(dis_offense)
+
+  # repeat the same formulas above for defensive players
+  index_defense = which(x==0)
+  x_defense_mean <- mean(z[index_defense])
+  y_defense_mean <- mean(k[index_defense])
+  x_defense_sd <- sd(z[index_defense])
+  y_defense_sd <- sd(k[index_defense])
+  
+  data_defense_dis <- data.frame(xs=z[index_defense],ys=k[index_defense])
+  
+  dis_defense <- apply(data_defense_dis,1,function(x){
+    dist(rbind(c(as.numeric(x['xs']),z[index_carrier]),c(as.numeric(x['ys']),k[index_carrier])))
+    })
+  
+  dis_defense_mean <- mean(dis_defense)
+  dis_defense_sd <- sd(dis_defense)
+  
+  return(data.frame(x_offense_mean,x_offense_sd,y_offense_mean,y_offense_sd,
+                    x_defense_mean,x_defense_sd,y_defense_mean,y_defense_sd,
+                    dis_offense_mean,dis_offense_sd,dis_defense_mean,dis_defense_sd))
+}
+
+# build function to retrieve the ball carrier's motion directions
+return_Dir = function (x,y) {
+  index_carrier = which(x==1)
+  y[index_carrier]
+}
+
+# feature engineering - create features for machine learning models
+nfl_bowl_summary <- nfl_bowl  %>% group_by(PlayId) %>% summarise (Yards=Yards[1],
+                                                                  feature_engineering(Offense,NflRusherYes,X_new,Y_new),
+                                                                  Season=Season[1],
+                                                                  YardToGo=YardToGo[1],
+                                                                  Quarter=Quarter[1],
+                                                                  Down=Down[1],
+                                                                  Distance=Distance[1],
+                                                                  Dis= mean(Dis),
+                                                                  Dir= return_Dir(NflRusherYes,Dir_new)
+                                                                  ,.groups='drop')
+nfl_bowl_summary[is.na(nfl_bowl_summary)] <- 0
+
+ggplot (nfl_bowl_data_test[1:22,],aes(x=X,y=Y,color=Team))+
+  geom_point(size=3) +
+  ylim(0,53)+
+  theme_bw()
+table (nfl_bowl_data_test$PlayDirection)
+# adjust player tracking coordinates
+ nfl_bowl  <- nfl_bowl_data_test %>% mutate(NflRusherYes = ifelse (NflId==NflIdRusher,1,0), # identify rushers
+                                       YardFromHome = ifelse (PossessionTeam==FieldPosition,YardLine,50+(50-YardLine)), # Yards from own goal if PossessionTeam==FieldPosition
+                                       TeamOffense = ifelse(PossessionTeam == HomeTeamAbbr, 'home', 'away'), # home or away team on offense if PossessionTeam == HomeTeamAbbr
+                                       Offense = ifelse(Team == TeamOffense,1,0), # offensive team or defensive team if team == TeamOffense
+                                       X_new = ifelse(PlayDirection=='left', 120-X, X) - 10, # flip X if plays moving from right to left
+                                       Y_new = ifelse(PlayDirection=='left', 160/3-Y, Y),# flip Y if [plays moving from right to left
+                                       YardToGo = 100-YardFromHome, # calculate yards to go
+                                       Dir_new = ifelse(PlayDirection=='left', Dir-180, Dir), # flip player directions if plays moving from right to left
+                                       Dir_new = ifelse(Dir_new<0, Dir_new+360, Dir_new)) # flip player directions if plays moving from right to left
+
+
+ggplot (nfl_bowl[1:22,],aes(x=X_new,y=Y_new,color=Team))+
+  geom_point(size=3) + 
+  ylim(0,53)+
+  geom_vline(aes(xintercept=YardFromHome), linetype="dashed")+
+  theme_bw()
+
+# create lines pointing player motion directions
+nfl_bowl2 <- nfl_bowl %>% mutate (X_end = 2*sin(Dir_new*pi/180) + X_new,
+                                  Y_end = 2*cos(Dir_new*pi/180) + Y_new)
+
+
+# visualize player motion directions in rushing plays
+ggplot (nfl_bowl2[1:22,],aes(x=X_new,y=Y_new,color=Team))+
+  geom_point(size=3) + 
+  geom_segment(aes(x = X_new, y = Y_new, xend = X_end,
+                   yend = Y_end), arrow = arrow(length = unit(.2,"cm")))+
+  geom_vline(aes(xintercept=YardFromHome), linetype="dashed")+
+  theme_bw()
+
+# build a function to calculate average x, y and distance
+feature_engineering= function(x,y,z,k) {
+  index_carrier = which(y==1) # index of the ball carrier
+  index_offense = which(x==1 & y==0) # index of offensive players
+  
+  x_offense_mean <- mean(z[index_offense]) # mean of x for offensive players
+  y_offense_mean <- mean(k[index_offense]) # mean of y for offensive players
+  x_offense_sd <- sd(z[index_offense]) # sd of x for offensive players
+  y_offense_sd <- sd(k[index_offense]) # sd of y for offensive players
+  
+  # get offensive players' x and y
+  data_offense_dis <- data.frame(xs=z[index_offense],ys=k[index_offense])
+  
+  # calculate each offensive player's distance to the ball carrier
+  dis_offense <- apply(data_offense_dis,1,function(x){
+    dist(rbind(c(as.numeric(x['xs']),z[index_carrier]),c(as.numeric(x['ys']),k[index_carrier])))
+    })
+  
+  # mean distance
+  dis_offense_mean <- mean(dis_offense)
+  # sd distance
+  dis_offense_sd <- sd(dis_offense)
+
+  # repeat the same formulas above for defensive players
+  index_defense = which(x==0)
+  x_defense_mean <- mean(z[index_defense])
+  y_defense_mean <- mean(k[index_defense])
+  x_defense_sd <- sd(z[index_defense])
+  y_defense_sd <- sd(k[index_defense])
+  
+  data_defense_dis <- data.frame(xs=z[index_defense],ys=k[index_defense])
+  
+  dis_defense <- apply(data_defense_dis,1,function(x){
+    dist(rbind(c(as.numeric(x['xs']),z[index_carrier]),c(as.numeric(x['ys']),k[index_carrier])))
+    })
+  
+  dis_defense_mean <- mean(dis_defense)
+  dis_defense_sd <- sd(dis_defense)
+  
+  return(data.frame(x_offense_mean,x_offense_sd,y_offense_mean,y_offense_sd,
+                    x_defense_mean,x_defense_sd,y_defense_mean,y_defense_sd,
+                    dis_offense_mean,dis_offense_sd,dis_defense_mean,dis_defense_sd))
+}
+
+# build function to retrieve the ball carrier's motion directions
+return_Dir = function (x,y) {
+  index_carrier = which(x==1)
+  y[index_carrier]
+}
+
+# feature engineering - create features for machine learning models
+nfl_bowl_summary2 <- nfl_bowl  %>% group_by(PlayId) %>% summarise (
+                                                                  feature_engineering(Offense,NflRusherYes,X_new,Y_new),
+                                                                  Season=Season[1],
+                                                                  YardToGo=YardToGo[1],
+                                                                  Quarter=Quarter[1],
+                                                                  Down=Down[1],
+                                                                  Distance=Distance[1],
+                                                                  Dis= mean(Dis),
+                                                                  Dir= return_Dir(NflRusherYes,Dir_new)
+                                                                  ,.groups='drop')
+nfl_bowl_summary2[is.na(nfl_bowl_summary2)] <- 0
+
+
+rf <- randomForest(Yards~., data=nfl_bowl_summary, proximity=TRUE) 
+
+lg_prediction <- predict(rf, nfl_bowl_summary2) %>% 
+  bind_cols(head(nfl_bowl_summary2,1000) %>% 
+  select(PlayId))
+lg_table <- data.frame(lg_prediction)
+```
